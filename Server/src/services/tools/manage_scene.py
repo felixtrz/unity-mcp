@@ -47,11 +47,13 @@ async def manage_scene(
     max_nodes: Annotated[int | str,
                          "Hard cap on returned nodes per request (safety)."] | None = None,
     max_depth: Annotated[int | str,
-                         "Accepted for forward-compatibility; current paging returns a single level."] | None = None,
+                         "Max depth for recursive hierarchy traversal. Only used when recursive=true."] | None = None,
     max_children_per_node: Annotated[int | str,
                                      "Child paging hint (safety)."] | None = None,
     include_transform: Annotated[bool | str,
                                  "If true, include local transform in node summaries."] | None = None,
+    recursive: Annotated[bool | str,
+                         "If true, return full recursive hierarchy instead of paged flat list. Warning: may produce large output for big scenes."] | None = None,
 ) -> dict[str, Any]:
     # Get active instance from session state
     # Removed session_state import
@@ -70,6 +72,7 @@ async def manage_scene(
             max_children_per_node, default=None)
         coerced_include_transform = coerce_bool(
             include_transform, default=None)
+        coerced_recursive = coerce_bool(recursive, default=None)
 
         params: dict[str, Any] = {"action": action}
         if name:
@@ -98,6 +101,8 @@ async def manage_scene(
             params["maxChildrenPerNode"] = coerced_max_children_per_node
         if coerced_include_transform is not None:
             params["includeTransform"] = coerced_include_transform
+        if coerced_recursive is not None:
+            params["recursive"] = coerced_recursive
 
         # Use centralized retry helper with instance routing
         response = await send_with_unity_instance(async_send_command_with_retry, unity_instance, "manage_scene", params)

@@ -35,6 +35,7 @@ namespace MCPForUnity.Editor.Tools
             public int? maxDepth { get; set; }
             public int? maxChildrenPerNode { get; set; }
             public bool? includeTransform { get; set; }
+            public bool? recursive { get; set; }
         }
 
         private static SceneCommand ToSceneCommand(JObject p)
@@ -81,6 +82,7 @@ namespace MCPForUnity.Editor.Tools
                 maxDepth = BI(p["maxDepth"] ?? p["max_depth"]),
                 maxChildrenPerNode = BI(p["maxChildrenPerNode"] ?? p["max_children_per_node"]),
                 includeTransform = BB(p["includeTransform"] ?? p["include_transform"]),
+                recursive = BB(p["recursive"]),
             };
         }
 
@@ -170,7 +172,16 @@ namespace MCPForUnity.Editor.Tools
                     return SaveScene(fullPath, relativePath);
                 case "get_hierarchy":
                     try { McpLog.Info("[ManageScene] get_hierarchy: entering", always: false); } catch { }
-                    var gh = GetSceneHierarchyPaged(cmd);
+                    object gh;
+                    if (cmd.recursive == true)
+                    {
+                        try { McpLog.Info("[ManageScene] get_hierarchy: using recursive mode", always: false); } catch { }
+                        gh = GetSceneHierarchyRecursive(cmd);
+                    }
+                    else
+                    {
+                        gh = GetSceneHierarchyPaged(cmd);
+                    }
                     try { McpLog.Info("[ManageScene] get_hierarchy: exiting", always: false); } catch { }
                     return gh;
                 case "get_active":
@@ -586,6 +597,174 @@ namespace MCPForUnity.Editor.Tools
                 try { McpLog.Error($"[ManageScene] get_hierarchy: exception {e.Message}"); } catch { }
                 return new ErrorResponse($"Error getting scene hierarchy: {e.Message}");
             }
+        }
+
+        /// <summary>
+        /// Returns the full recursive hierarchy of the scene.
+        /// Warning: Can produce very large output for complex scenes.
+        /// </summary>
+        private static object GetSceneHierarchyRecursive(SceneCommand cmd)
+        {
+            try
+            {
+                // Check Prefab Stage first
+                var prefabStage = PrefabStageUtility.GetCurrentPrefabStage();
+                Scene activeScene;
+
+                if (prefabStage != null)
+                {
+                    activeScene = prefabStage.scene;
+                    try { McpLog.Info("[ManageScene] get_hierarchy recursive: using Prefab Stage scene", always: false); } catch { }
+                }
+                else
+                {
+                    activeScene = EditorSceneManager.GetActiveScene();
+                }
+
+                if (!activeScene.IsValid() || !activeScene.isLoaded)
+                {
+                    return new ErrorResponse(
+                        "No valid and loaded scene is active to get hierarchy from."
+                    );
+                }
+
+                // Resolve max depth (default unlimited = -1, but clamp to reasonable max for safety)
+                int resolvedMaxDepth = cmd.maxDepth.HasValue ? Mathf.Clamp(cmd.maxDepth.Value, 1, 100) : -1;
+                bool includeTransform = cmd.includeTransform ?? true; // Default to true for recursive mode
+
+                List<object> hierarchy;
+                string scope;
+                int totalNodes = 0;
+
+                GameObject parentGo = ResolveGameObject(cmd.parent, activeScene);
+                if (cmd.parent == null || cmd.parent.Type == JTokenType.Null)
+                {
+                    // Return all root objects with their full subtrees
+                    var roots = activeScene.GetRootGameObjects().Where(go => go != null).ToList();
+                    hierarchy = new List<object>(roots.Count);
+                    foreach (var root in roots)
+                    {
+                        var nodeData = BuildGameObjectRecursive(root, includeTransform, resolvedMaxDepth, 0, ref totalNodes);
+                        if (nodeData != null) hierarchy.Add(nodeData);
+                    }
+                    scope = "full_scene";
+                }
+                else
+                {
+                    if (parentGo == null)
+                    {
+                        return new ErrorResponse($"Parent GameObject ('{cmd.parent}') not found.");
+                    }
+                    // Return the parent and all its descendants
+                    hierarchy = new List<object>(1);
+                    var nodeData = BuildGameObjectRecursive(parentGo, includeTransform, resolvedMaxDepth, 0, ref totalNodes);
+                    if (nodeData != null) hierarchy.Add(nodeData);
+                    scope = "subtree";
+                }
+
+                var payload = new
+                {
+                    scope = scope,
+                    recursive = true,
+                    maxDepth = resolvedMaxDepth == -1 ? "unlimited" : resolvedMaxDepth.ToString(),
+                    totalNodes = totalNodes,
+                    hierarchy = hierarchy,
+                };
+
+                var resp = new SuccessResponse($"Retrieved full recursive hierarchy for scene '{activeScene.name}'.", payload);
+                try { McpLog.Info($"[ManageScene] get_hierarchy recursive: success, {totalNodes} nodes", always: false); } catch { }
+                return resp;
+            }
+            catch (Exception e)
+            {
+                try { McpLog.Error($"[ManageScene] get_hierarchy recursive: exception {e.Message}"); } catch { }
+                return new ErrorResponse($"Error getting recursive scene hierarchy: {e.Message}");
+            }
+        }
+
+        /// <summary>
+        /// Recursively builds a data representation of a GameObject and its children with depth limiting.
+        /// </summary>
+        private static Dictionary<string, object> BuildGameObjectRecursive(GameObject go, bool includeTransform, int maxDepth, int currentDepth, ref int nodeCount)
+        {
+            if (go == null) return null;
+            nodeCount++;
+
+            // Get component type names
+            var componentTypes = new List<string>();
+            try
+            {
+                var components = go.GetComponents<Component>();
+                if (components != null)
+                {
+                    foreach (var c in components)
+                    {
+                        if (c != null)
+                        {
+                            componentTypes.Add(c.GetType().Name);
+                        }
+                    }
+                }
+            }
+            catch { }
+
+            var data = new Dictionary<string, object>
+            {
+                { "name", go.name },
+                { "instanceID", go.GetInstanceID() },
+                { "activeSelf", go.activeSelf },
+                { "activeInHierarchy", go.activeInHierarchy },
+                { "tag", go.tag },
+                { "layer", go.layer },
+                { "isStatic", go.isStatic },
+                { "path", GetGameObjectPath(go) },
+                { "componentTypes", componentTypes },
+            };
+
+            if (includeTransform && go.transform != null)
+            {
+                var t = go.transform;
+                data["transform"] = new Dictionary<string, object>
+                {
+                    { "localPosition", new[] { t.localPosition.x, t.localPosition.y, t.localPosition.z } },
+                    { "localRotation", new[] { t.localRotation.eulerAngles.x, t.localRotation.eulerAngles.y, t.localRotation.eulerAngles.z } },
+                    { "localScale", new[] { t.localScale.x, t.localScale.y, t.localScale.z } },
+                    { "worldPosition", new[] { t.position.x, t.position.y, t.position.z } },
+                };
+            }
+
+            // Build children recursively if not at max depth
+            int childCount = go.transform != null ? go.transform.childCount : 0;
+            data["childCount"] = childCount;
+
+            if (childCount > 0)
+            {
+                bool atMaxDepth = maxDepth > 0 && currentDepth >= maxDepth;
+                if (atMaxDepth)
+                {
+                    data["children"] = null;
+                    data["childrenTruncatedAtDepth"] = true;
+                }
+                else
+                {
+                    var children = new List<object>(childCount);
+                    foreach (Transform child in go.transform)
+                    {
+                        if (child != null)
+                        {
+                            var childData = BuildGameObjectRecursive(child.gameObject, includeTransform, maxDepth, currentDepth + 1, ref nodeCount);
+                            if (childData != null) children.Add(childData);
+                        }
+                    }
+                    data["children"] = children;
+                }
+            }
+            else
+            {
+                data["children"] = new List<object>();
+            }
+
+            return data;
         }
 
         private static GameObject ResolveGameObject(JToken targetToken, Scene activeScene)
